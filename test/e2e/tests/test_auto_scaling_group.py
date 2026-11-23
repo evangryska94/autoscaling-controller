@@ -25,9 +25,10 @@ from e2e.replacement_values import REPLACEMENT_VALUES
 from acktest import tags
 
 RESOURCE_PLURAL = "autoscalinggroups"
+INITIAL_METRICS = ["GroupDesiredCapacity", "GroupInServiceInstances"]
 
-@pytest.fixture(scope="module")
-def simple_auto_scaling_group():
+
+def _create_auto_scaling_group(enabled_metrics=None):
     resource_name = random_suffix_name("ack-test-asg", 32)
     
     replacements = REPLACEMENT_VALUES.copy()
@@ -37,6 +38,8 @@ def simple_auto_scaling_group():
         "auto_scaling_group",
         additional_replacements=replacements,
     )
+    if enabled_metrics is not None:
+        resource_data["spec"]["enabledMetrics"] = enabled_metrics
     logging.debug(resource_data)
 
     # Create the k8s resource
@@ -45,19 +48,68 @@ def simple_auto_scaling_group():
         resource_name, namespace="default",
     )
     k8s.create_custom_resource(ref, resource_data)
-    cr = k8s.wait_resource_consumed_by_controller(ref)
-
-    assert cr is not None
-    assert k8s.get_resource_exists(ref)
-
-    yield (ref, cr)
-
-    # Teardown
     try:
+        cr = k8s.wait_resource_consumed_by_controller(ref)
+        assert cr is not None
+        yield ref, cr
+    finally:
         _, deleted = k8s.delete_custom_resource(ref, 3, 10)
         assert deleted
-    except:
-        pass
+
+
+@pytest.fixture(scope="module")
+def simple_auto_scaling_group():
+    yield from _create_auto_scaling_group()
+
+
+@pytest.fixture
+def auto_scaling_group_with_metrics():
+    yield from _create_auto_scaling_group(INITIAL_METRICS)
+
+
+@pytest.fixture
+def auto_scaling_group_without_metrics():
+    yield from _create_auto_scaling_group()
+
+
+def _wait_for_aws_metrics(autoscaling_client, asg_name, expected):
+    expected_metrics = {(name, "1Minute") for name in expected}
+    for _ in range(30):
+        response = autoscaling_client.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[asg_name]
+        )
+        asg = response["AutoScalingGroups"][0]
+        observed = {
+            (metric["Metric"], metric["Granularity"])
+            for metric in asg.get("EnabledMetrics", [])
+        }
+        if observed == expected_metrics:
+            return asg
+        time.sleep(2)
+    pytest.fail(f"AWS metrics for {asg_name} are {observed}, expected {expected_metrics}")
+
+
+def _wait_for_synced_metrics(ref, autoscaling_client, asg_name, expected, generation=0):
+    expected_metrics = {(name, "1Minute") for name in expected}
+    for _ in range(30):
+        resource = k8s.get_resource(ref)
+        status = resource.get("status", {})
+        observed = {
+            (metric["metric"], metric["granularity"])
+            for metric in status.get("enabledMetrics", [])
+        }
+        # A previous generation can still show ResourceSynced=True after a patch.
+        current_generation = resource["metadata"]["generation"]
+        synced = any(
+            condition["type"] == "ACK.ResourceSynced"
+            and condition["status"] == "True"
+            and condition.get("observedGeneration") == current_generation
+            for condition in status.get("conditions", [])
+        )
+        if current_generation >= generation and synced and observed == expected_metrics:
+            return resource, _wait_for_aws_metrics(autoscaling_client, asg_name, expected)
+        time.sleep(2)
+    pytest.fail(f"{asg_name} did not sync generation {generation} with metrics {expected_metrics}: {status}")
 
 @pytest.fixture(scope="module")
 def auto_scaling_group_with_tags():
@@ -154,44 +206,62 @@ class TestAutoScalingGroup:
         # Confirm the resource is still synced
         assert k8s.wait_on_condition(ref, "ACK.ResourceSynced", "True", wait_periods=1)
 
-    def test_enabled_metrics(self, autoscaling_client, simple_auto_scaling_group):
-        ref, cr = simple_auto_scaling_group
+    def test_enabled_metrics(self, autoscaling_client, auto_scaling_group_with_metrics):
+        ref, cr = auto_scaling_group_with_metrics
         asg_name = cr["spec"]["name"]
 
-        def assert_enabled_metrics(expected):
-            # Wait for current status after the patch, since ResourceSynced may
-            # still be True from the previous generation.
-            expected_metrics = {(name, "1Minute") for name in expected}
-            for _ in range(30):
-                resource = k8s.get_resource(ref)
-                status = resource.get("status", {})
-                observed = {
-                    (metric["metric"], metric["granularity"])
-                    for metric in status.get("enabledMetrics", [])
-                }
-                if observed == expected_metrics:
-                    break
-                time.sleep(2)
-            assert observed == expected_metrics
-            assert set(resource["spec"]["enabledMetrics"]) == set(expected)
-            assert k8s.wait_on_condition(ref, "ACK.ResourceSynced", "True", wait_periods=3)
+        resource, _ = _wait_for_synced_metrics(ref, autoscaling_client, asg_name, INITIAL_METRICS)
+        assert resource["spec"]["enabledMetrics"] == INITIAL_METRICS
 
-            response = autoscaling_client.describe_auto_scaling_groups(
-                AutoScalingGroupNames=[asg_name]
-            )
-            assert {
-                (metric["Metric"], metric["Granularity"])
-                for metric in response["AutoScalingGroups"][0].get("EnabledMetrics", [])
-            } == expected_metrics
+        # A capacity update must preserve the requested set and remove external drift.
+        external_metric = "GroupMaxSize"
+        autoscaling_client.enable_metrics_collection(
+            AutoScalingGroupName=asg_name, Granularity="1Minute", Metrics=[external_metric]
+        )
+        _wait_for_aws_metrics(autoscaling_client, asg_name, INITIAL_METRICS + [external_metric])
+        patched = k8s.patch_custom_resource(ref, {"spec": {"maxSize": 4}})
+        resource, asg = _wait_for_synced_metrics(
+            ref, autoscaling_client, asg_name, INITIAL_METRICS, patched["metadata"]["generation"]
+        )
+        assert resource["spec"]["enabledMetrics"] == INITIAL_METRICS
+        assert asg["MaxSize"] == 4
 
-        assert_enabled_metrics(["GroupDesiredCapacity", "GroupInServiceInstances"])
-
+        # Submit a metrics change and an ordinary ASG update together.
         updated_metrics = ["GroupDesiredCapacity", "GroupTotalInstances"]
-        k8s.patch_custom_resource(ref, {"spec": {"enabledMetrics": updated_metrics}})
-        assert_enabled_metrics(updated_metrics)
+        patched = k8s.patch_custom_resource(
+            ref, {"spec": {"enabledMetrics": updated_metrics, "maxSize": 5}}
+        )
+        resource, asg = _wait_for_synced_metrics(
+            ref, autoscaling_client, asg_name, updated_metrics, patched["metadata"]["generation"]
+        )
+        assert resource["spec"]["enabledMetrics"] == updated_metrics
+        assert asg["MaxSize"] == 5
 
-        k8s.patch_custom_resource(ref, {"spec": {"enabledMetrics": []}})
-        assert_enabled_metrics([])
+        patched = k8s.patch_custom_resource(ref, {"spec": {"enabledMetrics": []}})
+        resource, _ = _wait_for_synced_metrics(
+            ref, autoscaling_client, asg_name, [], patched["metadata"]["generation"]
+        )
+        assert resource["spec"]["enabledMetrics"] == []
+
+    def test_omitted_enabled_metrics_preserve_external_metrics(
+        self, autoscaling_client, auto_scaling_group_without_metrics
+    ):
+        ref, cr = auto_scaling_group_without_metrics
+        asg_name = cr["spec"]["name"]
+        resource, _ = _wait_for_synced_metrics(ref, autoscaling_client, asg_name, [])
+        assert "enabledMetrics" not in resource["spec"]
+
+        external_metrics = ["GroupMinSize"]
+        autoscaling_client.enable_metrics_collection(
+            AutoScalingGroupName=asg_name, Granularity="1Minute", Metrics=external_metrics
+        )
+        _wait_for_aws_metrics(autoscaling_client, asg_name, external_metrics)
+        patched = k8s.patch_custom_resource(ref, {"spec": {"maxSize": 4}})
+        resource, asg = _wait_for_synced_metrics(
+            ref, autoscaling_client, asg_name, external_metrics, patched["metadata"]["generation"]
+        )
+        assert "enabledMetrics" not in resource["spec"]
+        assert asg["MaxSize"] == 4
 
     def test_create_with_tags(self, autoscaling_client, auto_scaling_group_with_tags):
         """Test that tags specified at creation time are correctly applied to the ASG."""
