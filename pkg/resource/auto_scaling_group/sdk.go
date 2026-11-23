@@ -768,11 +768,6 @@ func (rm *resourceManager) sdkCreate(
 			}
 		}
 	}()
-	if len(ko.Spec.EnabledMetricNames) > 0 {
-		if err = rm.syncMetricsCollection(ctx, ko.Spec.Name, ko.Spec.EnabledMetricNames, nil, "CREATE"); err != nil {
-			return nil, err
-		}
-	}
 	if ko.Spec.Tags != nil || ko.Spec.EnabledMetricNames != nil {
 		ackcondition.SetSynced(&resource{ko}, corev1.ConditionFalse, nil, nil)
 	}
@@ -1394,8 +1389,6 @@ func (rm *resourceManager) sdkUpdate(
 	defer func() {
 		exit(err)
 	}()
-	updatedDesired := rm.concreteResource(desired.DeepCopy())
-	updatedDesired.SetStatus(latest)
 	if delta.DifferentAt("Spec.Tags") {
 		name := string(*latest.ko.Spec.Name)
 		err = syncTags(
@@ -1407,26 +1400,10 @@ func (rm *resourceManager) sdkUpdate(
 			return nil, err
 		}
 	}
-	if delta.DifferentAt(enabledMetricsDeltaPath) {
-		if err = rm.syncMetricsCollection(
-			ctx, latest.ko.Spec.Name, desired.ko.Spec.EnabledMetricNames, latest.ko.Status.EnabledMetrics, "UPDATE",
-		); err != nil {
-			return nil, err
-		}
-		observed, readErr := rm.sdkFind(ctx, desired)
-		if readErr != nil {
-			return nil, readErr
-		}
-		desired.ko.Status.EnabledMetrics = observed.ko.Status.EnabledMetrics
-		updatedDesired.ko.Status.EnabledMetrics = observed.ko.Status.EnabledMetrics
-		if !requestedMetricNames(desired.ko.Spec.EnabledMetricNames).Equal(enabledMetricNames(observed.ko.Status.EnabledMetrics)) {
-			return updatedDesired, ackrequeue.NeededAfter(
-				ackerr.TemporaryOutOfSync, ackrequeue.DefaultRequeueAfterDuration,
-			)
-		}
-	}
 	if !delta.DifferentExcept("Spec.Tags", enabledMetricsDeltaPath) {
-		return updatedDesired, nil
+		ko := desired.ko.DeepCopy()
+		latest.ko.Status.DeepCopyInto(&ko.Status)
+		return &resource{ko}, rm.updateMetricsCollection(ctx, ko, latest, delta)
 	}
 
 	input, err := rm.newUpdateRequestPayload(ctx, desired, delta)
@@ -1446,6 +1423,10 @@ func (rm *resourceManager) sdkUpdate(
 	ko := desired.ko.DeepCopy()
 
 	rm.setStatusDefaults(ko)
+	if err = rm.updateMetricsCollection(ctx, ko, latest, delta); err != nil {
+		return &resource{ko}, err
+	}
+
 	return &resource{ko}, nil
 }
 

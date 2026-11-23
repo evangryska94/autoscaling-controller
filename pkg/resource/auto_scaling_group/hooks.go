@@ -16,8 +16,11 @@ package auto_scaling_group
 import (
 	"context"
 
+	ackcompare "github.com/aws-controllers-k8s/runtime/pkg/compare"
+	ackcondition "github.com/aws-controllers-k8s/runtime/pkg/condition"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	svcsdk "github.com/aws/aws-sdk-go-v2/service/autoscaling"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	svcapitypes "github.com/aws-controllers-k8s/autoscaling-controller/apis/v1alpha1"
@@ -48,15 +51,18 @@ func enabledMetricNames(metrics []*svcapitypes.EnabledMetric) sets.Set[string] {
 	return names
 }
 
-func (rm *resourceManager) syncMetricsCollection(
+func (rm *resourceManager) updateMetricsCollection(
 	ctx context.Context,
-	groupName *string,
-	requested []*string,
-	enabled []*svcapitypes.EnabledMetric,
-	opType string,
+	ko *svcapitypes.AutoScalingGroup,
+	latest *resource,
+	delta *ackcompare.Delta,
 ) error {
-	desired := requestedMetricNames(requested)
-	current := enabledMetricNames(enabled)
+	if !delta.DifferentAt(enabledMetricsDeltaPath) {
+		return nil
+	}
+	desired := requestedMetricNames(ko.Spec.EnabledMetricNames)
+	current := enabledMetricNames(latest.ko.Status.EnabledMetrics)
+	groupName := latest.ko.Spec.Name
 
 	// Neither API may receive an empty list because AWS would apply it to all
 	// metrics. Enable additions first so an invalid metric leaves existing
@@ -67,7 +73,7 @@ func (rm *resourceManager) syncMetricsCollection(
 			Granularity:          aws.String("1Minute"),
 			Metrics:              sets.List(additions),
 		})
-		rm.metrics.RecordAPICall(opType, "EnableMetricsCollection", err)
+		rm.metrics.RecordAPICall("UPDATE", "EnableMetricsCollection", err)
 		if err != nil {
 			return err
 		}
@@ -78,10 +84,12 @@ func (rm *resourceManager) syncMetricsCollection(
 			AutoScalingGroupName: groupName,
 			Metrics:              sets.List(removals),
 		})
-		rm.metrics.RecordAPICall(opType, "DisableMetricsCollection", err)
+		rm.metrics.RecordAPICall("UPDATE", "DisableMetricsCollection", err)
 		if err != nil {
 			return err
 		}
 	}
+	// Let the next reconciliation read the metrics after AWS processes the change.
+	ackcondition.SetSynced(&resource{ko}, corev1.ConditionFalse, nil, nil)
 	return nil
 }

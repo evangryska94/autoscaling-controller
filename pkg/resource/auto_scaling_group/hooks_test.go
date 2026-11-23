@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -25,7 +26,6 @@ import (
 	ackcondition "github.com/aws-controllers-k8s/runtime/pkg/condition"
 	ackerr "github.com/aws-controllers-k8s/runtime/pkg/errors"
 	ackmetrics "github.com/aws-controllers-k8s/runtime/pkg/metrics"
-	ackrequeue "github.com/aws-controllers-k8s/runtime/pkg/requeue"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	svcsdk "github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	corev1 "k8s.io/api/core/v1"
@@ -42,33 +42,28 @@ func TestEnabledMetricsUpdate(t *testing.T) {
 		name      string
 		current   []string
 		requested []string
-		want      []string
 		calls     []string
 	}{
-		{name: "existing metrics / omitted", current: existing, want: existing},
+		{name: "existing metrics / omitted", current: existing},
 		{
 			name: "existing metrics / empty list", current: existing, requested: []string{},
-			calls: []string{"DisableMetricsCollection GroupMaxSize GroupMinSize", "DescribeAutoScalingGroups"},
+			calls: []string{"DisableMetricsCollection GroupMaxSize GroupMinSize"},
 		},
 		{
 			name: "existing metrics / same set reordered with a duplicate", current: existing,
-			requested: []string{"GroupMinSize", "GroupMaxSize", "GroupMinSize"}, want: existing,
+			requested: []string{"GroupMinSize", "GroupMaxSize", "GroupMinSize"},
 		},
 		{
 			name: "existing metrics / different set", current: existing,
 			requested: []string{"GroupMinSize", "GroupDesiredCapacity", "GroupDesiredCapacity"},
-			want:      []string{"GroupDesiredCapacity", "GroupMinSize"},
-			calls:     []string{"EnableMetricsCollection GroupDesiredCapacity", "DisableMetricsCollection GroupMaxSize", "DescribeAutoScalingGroups"},
+			calls:     []string{"EnableMetricsCollection GroupDesiredCapacity", "DisableMetricsCollection GroupMaxSize"},
 		},
 		{name: "no existing metrics / omitted"},
 		{name: "no existing metrics / empty list", requested: []string{}},
-		// The observed set is empty, so explicitly requesting the same set is also [].
-		{name: "no existing metrics / same set as observed", requested: []string{}},
 		{
 			name:      "no existing metrics / different set",
 			requested: []string{"GroupMinSize", "GroupDesiredCapacity"},
-			want:      []string{"GroupDesiredCapacity", "GroupMinSize"},
-			calls:     []string{"EnableMetricsCollection GroupDesiredCapacity GroupMinSize", "DescribeAutoScalingGroups"},
+			calls:     []string{"EnableMetricsCollection GroupDesiredCapacity GroupMinSize"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -87,18 +82,25 @@ func TestEnabledMetricsUpdate(t *testing.T) {
 			assertRequestedMetrics(t, roundTrip.Spec.EnabledMetricNames, tc.requested)
 			desired.ko = &roundTrip
 
-			rm, calls := newMetricsTestManager(t, tc.want...)
+			rm, calls := newMetricsTestManager(t)
 			delta := newResourceDelta(desired, latest)
 			if got, want := delta.DifferentAt(enabledMetricsDeltaPath), len(tc.calls) > 0; got != want {
 				t.Fatalf("metrics delta = %t, want %t", got, want)
 			}
-			updated, err := rm.sdkUpdate(t.Context(), desired, latest, delta)
+			before := desired.ko.DeepCopy()
+			updated, err := rm.Update(t.Context(), desired, latest, delta)
 			if err != nil {
 				t.Fatal(err)
 			}
 			assertCalls(t, *calls, tc.calls...)
-			assertRequestedMetrics(t, updated.ko.Spec.EnabledMetricNames, tc.requested)
-			assertObservedMetrics(t, updated, tc.want...)
+			assertRequestedMetrics(t, rm.concreteResource(updated).ko.Spec.EnabledMetricNames, tc.requested)
+			assertObservedMetrics(t, rm.concreteResource(updated), tc.current...)
+			if condition := ackcondition.Synced(updated); len(tc.calls) > 0 && (condition == nil || condition.Status != corev1.ConditionFalse) {
+				t.Fatalf("synced condition = %v, want False until the next read", condition)
+			}
+			if !reflect.DeepEqual(desired.ko, before) {
+				t.Fatal("update changed the caller's desired resource")
+			}
 		})
 	}
 }
@@ -108,18 +110,22 @@ func TestEnabledMetricsUpdateWithCapacityChange(t *testing.T) {
 	latest := metricsTestResource(nil, nil)
 	desired.ko.Spec.MaxSize = aws.Int64(5)
 
-	rm, calls := newMetricsTestManager(t, "GroupMinSize")
+	rm, calls := newMetricsTestManager(t)
 	updated, err := rm.sdkUpdate(t.Context(), desired, latest, newResourceDelta(desired, latest))
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertCalls(t, *calls, "EnableMetricsCollection GroupMinSize", "DescribeAutoScalingGroups", "UpdateAutoScalingGroup MaxSize=5")
-	assertObservedMetrics(t, updated, "GroupMinSize")
+	assertCalls(t, *calls, "UpdateAutoScalingGroup MaxSize=5", "EnableMetricsCollection GroupMinSize")
+	assertObservedMetrics(t, updated)
+	if condition := ackcondition.Synced(updated); condition == nil || condition.Status != corev1.ConditionFalse {
+		t.Fatalf("synced condition = %v, want False until the next read", condition)
+	}
 }
 
 func TestEnabledMetricsUpdateWithInvalidMetric(t *testing.T) {
-	desired := metricsTestResource([]string{"InvalidMetric"}, nil)
+	desired := metricsTestResource([]string{"InvalidMetric"}, []string{"GroupMinSize"})
 	latest := metricsTestResource(nil, []string{"GroupMinSize"})
+	desired.ko.Spec.MaxSize = aws.Int64(5)
 
 	rm, calls := newMetricsTestManager(t)
 	updated, err := rm.Update(t.Context(), desired, latest, newResourceDelta(desired, latest))
@@ -132,37 +138,43 @@ func TestEnabledMetricsUpdateWithInvalidMetric(t *testing.T) {
 		t.Fatalf("terminal condition = %v, want the AWS validation message", condition)
 	}
 	// The rejected enable must leave the existing metrics alone.
-	assertCalls(t, *calls, "EnableMetricsCollection InvalidMetric")
+	assertCalls(t, *calls, "UpdateAutoScalingGroup MaxSize=5", "EnableMetricsCollection InvalidMetric")
 	assertObservedMetrics(t, rm.concreteResource(updated), "GroupMinSize")
 }
 
-func TestEnabledMetricsUpdateWithStaleReadback(t *testing.T) {
+func TestEnabledMetricsConvergesOnNextRead(t *testing.T) {
 	desired := metricsTestResource([]string{"GroupMinSize"}, nil)
 	latest := metricsTestResource(nil, nil)
 
-	// AWS has accepted the enable, but the metrics aren't visible yet.
-	rm, calls := newMetricsTestManager(t)
-	updated, err := rm.sdkUpdate(t.Context(), desired, latest, newResourceDelta(desired, latest))
-	var requeue *ackrequeue.RequeueNeededAfter
-	if !errors.As(err, &requeue) {
-		t.Fatalf("update error = %v, want a delayed requeue", err)
+	rm, calls := newMetricsTestManager(t, "GroupMinSize")
+	updated, err := rm.Update(t.Context(), desired, latest, newResourceDelta(desired, latest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCalls(t, *calls, "EnableMetricsCollection GroupMinSize")
+	assertObservedMetrics(t, rm.concreteResource(updated))
+
+	observed, err := rm.ReadOne(t.Context(), desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertObservedMetrics(t, rm.concreteResource(observed), "GroupMinSize")
+	if delta := newResourceDelta(desired, rm.concreteResource(observed)); delta.DifferentAt(enabledMetricsDeltaPath) {
+		t.Fatal("matching metrics still produce a delta after the next read")
 	}
 	assertCalls(t, *calls, "EnableMetricsCollection GroupMinSize", "DescribeAutoScalingGroups")
-	assertRequestedMetrics(t, updated.ko.Spec.EnabledMetricNames, []string{"GroupMinSize"})
-	assertObservedMetrics(t, updated)
 }
 
 func TestEnabledMetricsCreate(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		requested []string
-		calls     []string
+		name       string
+		requested  []string
+		wantUpdate bool
 	}{
-		{name: "omitted", calls: []string{"CreateAutoScalingGroup"}},
-		{name: "empty list", requested: []string{}, calls: []string{"CreateAutoScalingGroup"}},
+		{name: "omitted"},
+		{name: "empty list", requested: []string{}, wantUpdate: true},
 		{
-			name: "enable after creation", requested: []string{"GroupMinSize"},
-			calls: []string{"CreateAutoScalingGroup", "EnableMetricsCollection GroupMinSize"},
+			name: "enable after creation", requested: []string{"GroupMinSize"}, wantUpdate: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -171,22 +183,15 @@ func TestEnabledMetricsCreate(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			assertCalls(t, *calls, tc.calls...)
+			assertCalls(t, *calls, "CreateAutoScalingGroup")
 			assertRequestedMetrics(t, created.ko.Spec.EnabledMetricNames, tc.requested)
+
+			condition := ackcondition.Synced(created)
+			if got := condition != nil && condition.Status == corev1.ConditionFalse; got != tc.wantUpdate {
+				t.Fatalf("create requested an update = %t, want %t", got, tc.wantUpdate)
+			}
 		})
 	}
-}
-
-func TestEnabledMetricsCreateWithInvalidMetric(t *testing.T) {
-	rm, calls := newMetricsTestManager(t)
-	created, err := rm.sdkCreate(t.Context(), metricsTestResource([]string{"InvalidMetric"}, nil))
-	if !ackerr.IsPostCreateError(err) {
-		t.Fatalf("create error = %v, want a post-create error", err)
-	}
-	if created == nil || aws.ToString(created.ko.Spec.Name) != metricsTestGroupName {
-		t.Fatalf("create did not return the group identifier: %v", created)
-	}
-	assertCalls(t, *calls, "CreateAutoScalingGroup", "EnableMetricsCollection InvalidMetric")
 }
 
 func metricsTestResource(requested, observed []string) *resource {
