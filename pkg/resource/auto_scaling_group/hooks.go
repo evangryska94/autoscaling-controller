@@ -29,8 +29,10 @@ import (
 
 var syncTags = tags.Tags
 
-// Use the Kubernetes field name so IgnoreFieldDrift can match spec.enabledMetrics
-// by case folding. The Go spec field is EnabledMetricNames.
+// IgnoreFieldDrift compares delta paths with annotation paths without regard to case.
+// Spec.EnabledMetrics matches the manifest path spec.enabledMetrics. The Go field
+// path Spec.EnabledMetricNames would leave the delta in place, so ACK could
+// update metrics that the annotation tells it to ignore.
 const enabledMetricsDeltaPath = "Spec.EnabledMetrics"
 
 func requestedMetricNames(metrics []*string) sets.Set[string] {
