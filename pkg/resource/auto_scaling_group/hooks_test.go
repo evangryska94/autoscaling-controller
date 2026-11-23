@@ -23,9 +23,11 @@ import (
 	"strings"
 	"testing"
 
+	ackv1alpha1 "github.com/aws-controllers-k8s/runtime/apis/core/v1alpha1"
 	ackcondition "github.com/aws-controllers-k8s/runtime/pkg/condition"
 	ackerr "github.com/aws-controllers-k8s/runtime/pkg/errors"
 	ackmetrics "github.com/aws-controllers-k8s/runtime/pkg/metrics"
+	ackrt "github.com/aws-controllers-k8s/runtime/pkg/runtime"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	svcsdk "github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	corev1 "k8s.io/api/core/v1"
@@ -35,6 +37,22 @@ import (
 )
 
 const metricsTestGroupName = "test-asg"
+
+func TestEnabledMetricsDeltaMatchesIgnoreFieldDriftPath(t *testing.T) {
+	desired := metricsTestResource([]string{"GroupMinSize"}, nil)
+	desired.ko.Annotations = map[string]string{
+		ackv1alpha1.AnnotationIgnoreFieldDrift: "spec.enabledMetrics",
+	}
+	latest := metricsTestResource(nil, nil)
+	delta := newResourceDelta(desired, latest)
+	paths := ackrt.IgnoreFieldDriftPaths(desired)
+	if len(delta.Differences) != 1 || len(paths) != 1 {
+		t.Fatalf("got %d differences and ignore paths %v, want one of each", len(delta.Differences), paths)
+	}
+	if path := delta.Differences[0].Path; !path.ContainsFold(paths[0]) {
+		t.Fatalf("metrics delta path %v does not match ignore path %q", path, paths[0])
+	}
+}
 
 func TestEnabledMetricsUpdate(t *testing.T) {
 	existing := []string{"GroupMaxSize", "GroupMinSize"}

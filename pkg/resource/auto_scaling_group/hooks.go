@@ -29,6 +29,8 @@ import (
 
 var syncTags = tags.Tags
 
+// Use the Kubernetes field name so IgnoreFieldDrift can match spec.enabledMetrics
+// by case folding. The Go spec field is EnabledMetricNames.
 const enabledMetricsDeltaPath = "Spec.EnabledMetrics"
 
 func requestedMetricNames(metrics []*string) sets.Set[string] {
